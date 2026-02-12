@@ -295,7 +295,12 @@ def get_image_dimensions(filepath: Path) -> Tuple[int, int]:
 def download_image(session: requests.Session, url: str, dest_dir: Path, index: int) -> Optional[Dict]:
     """Download a single image and return metadata or None."""
     try:
-        resp = session.get(url, timeout=15, stream=True)
+        resp = session.get(url, timeout=15, stream=True, headers={
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-origin",
+        })
         resp.raise_for_status()
 
         content_type = resp.headers.get("content-type", "")
@@ -346,10 +351,36 @@ def download_image(session: requests.Session, url: str, dest_dir: Path, index: i
 # ---------------------------------------------------------------------------
 
 def fetch_page(session: requests.Session, url: str) -> str:
-    """Fetch the full HTML of a page."""
-    resp = session.get(url, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+    """Fetch the full HTML of a page with retry logic for bot protection."""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            return resp.text
+        except requests.HTTPError as e:
+            if resp.status_code == 403 and attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    f"Got 403 Forbidden (attempt {attempt + 1}/{max_retries}). "
+                    f"Retrying in {wait}s..."
+                )
+                time.sleep(wait)
+                # Rotate User-Agent on retry
+                agents = [
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
+                    "Gecko/20100101 Firefox/126.0",
+                ]
+                session.headers["User-Agent"] = agents[attempt % len(agents)]
+                session.headers["Referer"] = url
+                continue
+            raise
 
 
 def scrape_banners(url: str, output_dir: str = "novadreams_banners", all_images: bool = False) -> List[Dict]:
@@ -373,15 +404,30 @@ def scrape_banners(url: str, output_dir: str = "novadreams_banners", all_images:
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
+            "Chrome/125.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Ch-Ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
     })
 
     logger.info(f"Fetching {url} ...")
     html = fetch_page(session, url)
     logger.info(f"Received {len(html)} bytes of HTML")
+
+    # Set Referer for subsequent image requests
+    session.headers["Referer"] = url
 
     # --- Parse images ---
     all_found: List[Dict] = []
@@ -544,6 +590,17 @@ Examples:
     except requests.ConnectionError:
         print(f"\nCould not connect to {args.url}")
         print("Check your internet connection and that the URL is correct.")
+        sys.exit(1)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 403:
+            logger.error(f"Access denied (403 Forbidden) after retries: {args.url}")
+            logger.error("The site may be using CloudFlare or similar bot protection.")
+            logger.error("Suggestions:")
+            logger.error("  1. Try a specific subpage: --url https://www.novadreams.com/promotions")
+            logger.error("  2. Try again later (rate limiting may expire)")
+            logger.error("  3. Check if the site is accessible in your browser")
+        else:
+            logger.error(f"HTTP error: {e}")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Scraping failed: {e}")
