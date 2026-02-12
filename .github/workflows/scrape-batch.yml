@@ -1,0 +1,96 @@
+name: Batch Scrape Banners
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Comma-separated URLs (leave empty to use sites_example.txt)"
+        required: false
+        default: ""
+      all_images:
+        description: "Download all images (not just banners)"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run batch scraper
+        run: |
+          FLAGS=""
+          if [ "${{ github.event.inputs.all_images }}" = "true" ]; then
+            FLAGS="--all-images"
+          fi
+
+          URLS="${{ github.event.inputs.urls }}"
+          if [ -n "$URLS" ]; then
+            # Scrape each comma-separated URL
+            IFS=',' read -ra URL_ARRAY <<< "$URLS"
+            for url in "${URL_ARRAY[@]}"; do
+              url=$(echo "$url" | xargs)  # trim whitespace
+              if [ -n "$url" ]; then
+                echo "=== Scraping: $url ==="
+                python scrape_novadreams.py --url "$url" --output novadreams_banners $FLAGS || true
+                echo ""
+              fi
+            done
+          else
+            # Scrape from sites_example.txt
+            while IFS= read -r url; do
+              url=$(echo "$url" | xargs)
+              # Skip empty lines and comments
+              [[ -z "$url" || "$url" == \#* ]] && continue
+              # Prepend https:// if no protocol
+              [[ "$url" != http* ]] && url="https://$url"
+              echo "=== Scraping: $url ==="
+              python scrape_novadreams.py --url "$url" --output novadreams_banners $FLAGS || true
+              echo ""
+            done < examples/sites_example.txt
+          fi
+
+      - name: Summary
+        run: |
+          echo "=== Downloaded banners ==="
+          find novadreams_banners -type f -name "*.json" -path "*/manifest.json" | while read f; do
+            dir=$(dirname "$f")
+            count=$(find "$dir" -type f \( -name "*.jpg" -o -name "*.png" -o -name "*.gif" -o -name "*.webp" \) | wc -l)
+            echo "  $(basename "$dir"): $count images"
+          done
+
+      - name: Upload banners as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-banners-${{ github.run_number }}
+          path: novadreams_banners/
+          retention-days: 30
+
+      - name: Commit banners to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add novadreams_banners/
+          if git diff --cached --quiet; then
+            echo "No new banners to commit"
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            git commit -m "Auto-scraped batch banners ($TIMESTAMP)"
+            git push
+          fi
