@@ -1,0 +1,78 @@
+name: Scrape Banners
+
+on:
+  # Run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL to scrape (leave empty for default novadreams.com)"
+        required: false
+        default: "https://www.novadreams.com/"
+      all_images:
+        description: "Download all images (not just banners)"
+        required: false
+        type: boolean
+        default: false
+
+  # Or run on a schedule (every Monday at 8am UTC)
+  schedule:
+    - cron: "0 8 * * 1"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run banner scraper
+        run: |
+          URL="${{ github.event.inputs.url || 'https://www.novadreams.com/' }}"
+          FLAGS=""
+          if [ "${{ github.event.inputs.all_images }}" = "true" ]; then
+            FLAGS="--all-images"
+          fi
+          python scrape_novadreams.py --url "$URL" --output novadreams_banners $FLAGS
+
+      - name: List downloaded banners
+        run: |
+          echo "=== Downloaded banners ==="
+          find novadreams_banners -type f | head -50
+          echo ""
+          if [ -f novadreams_banners/*/manifest.json ]; then
+            echo "=== Manifest ==="
+            cat novadreams_banners/*/manifest.json
+          fi
+
+      - name: Upload banners as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: novadreams-banners-${{ github.run_number }}
+          path: novadreams_banners/
+          retention-days: 30
+
+      - name: Commit banners to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add novadreams_banners/
+          if git diff --cached --quiet; then
+            echo "No new banners to commit"
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            git commit -m "Auto-scraped banners from novadreams.com ($TIMESTAMP)"
+            git push
+          fi
