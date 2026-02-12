@@ -10,16 +10,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Ensure requests is installed
-if ! python3 -c "import requests" 2>/dev/null; then
-    echo "Installing requests..."
-    pip3 install --quiet requests
-fi
-
-# Optional: install bs4 for better parsing
-if ! python3 -c "import bs4" 2>/dev/null; then
-    echo "Installing beautifulsoup4 for better parsing..."
-    pip3 install --quiet beautifulsoup4 || true
+# Ensure playwright is installed
+if ! python3 -c "from playwright.sync_api import sync_playwright" 2>/dev/null; then
+    echo "Installing playwright..."
+    pip3 install --quiet playwright
+    echo "Installing Chromium browser..."
+    playwright install chromium --with-deps
 fi
 
 python3 "$SCRIPT_DIR/scrape_novadreams.py" "$@"

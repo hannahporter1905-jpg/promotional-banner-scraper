@@ -2,187 +2,39 @@
 """
 NovaDreams Banner Scraper
 =========================
-Lightweight promotional banner extractor for novadreams.com.
-Uses only `requests` + Python stdlib (html.parser) so it runs anywhere
-without Selenium or Chrome.
-
-Optional: install beautifulsoup4 for improved parsing.
+Promotional banner extractor using Playwright (headless Chromium).
+Bypasses CloudFlare and other bot protection by running a real browser.
 
 Usage:
     python scrape_novadreams.py
     python scrape_novadreams.py --output my_banners
     python scrape_novadreams.py --all-images
+    python scrape_novadreams.py --url https://www.novadreams.com/promotions
 """
 
-import os
-import sys
 import argparse
 import hashlib
 import json
-import re
-import time
-import struct
 import logging
-from html.parser import HTMLParser
+import re
+import struct
+import sys
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from typing import List, Dict, Tuple, Optional
 
 try:
-    import requests
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 except ImportError:
-    print("Missing 'requests' package. Install with: pip install requests")
+    print("Missing 'playwright' package. Install with:")
+    print("  pip install playwright && playwright install chromium")
     sys.exit(1)
-
-# Optional: use BeautifulSoup when available for better parsing
-try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
-except ImportError:
-    HAS_BS4 = False
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 TARGET_URL = "https://www.novadreams.com/"
-
-# ---------------------------------------------------------------------------
-# Stdlib HTML image extractor (no external parser needed)
-# ---------------------------------------------------------------------------
-
-class ImageHTMLParser(HTMLParser):
-    """Extract image data from HTML using only the stdlib."""
-
-    def __init__(self, base_url: str):
-        super().__init__()
-        self.base_url = base_url
-        self.images: List[Dict] = []
-        self._current_context: List[str] = []
-
-    def _resolve(self, url: str) -> str:
-        if not url or url.startswith("data:"):
-            return ""
-        return urljoin(self.base_url, url)
-
-    def handle_starttag(self, tag: str, attrs):
-        attr = dict(attrs)
-
-        # Track context (e.g. inside a <section class="banner">)
-        if tag in ("div", "section", "header", "a", "figure"):
-            self._current_context.append(
-                f"{tag}.{attr.get('class', '')} #{attr.get('id', '')}"
-            )
-
-        # <img> tags
-        if tag == "img":
-            src = self._resolve(attr.get("src", ""))
-            srcset = attr.get("srcset", "")
-            data_src = self._resolve(attr.get("data-src", "") or attr.get("data-lazy-src", ""))
-            if src or data_src:
-                self.images.append({
-                    "url": src or data_src,
-                    "alt": attr.get("alt", ""),
-                    "title": attr.get("title", ""),
-                    "class": attr.get("class", ""),
-                    "width": self._parse_dim(attr.get("width")),
-                    "height": self._parse_dim(attr.get("height")),
-                    "srcset": self._parse_srcset(srcset),
-                    "context": " > ".join(self._current_context[-3:]),
-                    "tag": "img",
-                })
-
-        # <source> inside <picture>
-        if tag == "source":
-            srcset = attr.get("srcset", "")
-            for url in self._parse_srcset(srcset):
-                resolved = self._resolve(url)
-                if resolved:
-                    self.images.append({
-                        "url": resolved,
-                        "alt": "",
-                        "title": "",
-                        "class": attr.get("class", ""),
-                        "width": 0,
-                        "height": 0,
-                        "srcset": [],
-                        "context": " > ".join(self._current_context[-3:]),
-                        "tag": "source",
-                    })
-
-        # Inline background-image styles
-        style = attr.get("style", "")
-        if style:
-            for bg_url in re.findall(r'background(?:-image)?\s*:[^;]*url\(["\']?([^"\')\s]+)["\']?\)', style):
-                resolved = self._resolve(bg_url)
-                if resolved:
-                    self.images.append({
-                        "url": resolved,
-                        "alt": "",
-                        "title": "",
-                        "class": attr.get("class", ""),
-                        "width": 0,
-                        "height": 0,
-                        "srcset": [],
-                        "context": " > ".join(self._current_context[-3:]),
-                        "tag": f"{tag}[style]",
-                    })
-
-    def handle_endtag(self, tag: str):
-        if tag in ("div", "section", "header", "a", "figure") and self._current_context:
-            self._current_context.pop()
-
-    # -- helpers --
-    @staticmethod
-    def _parse_dim(val) -> int:
-        if not val:
-            return 0
-        try:
-            return int(str(val).replace("px", "").strip())
-        except ValueError:
-            return 0
-
-    def _parse_srcset(self, srcset: str) -> List[str]:
-        if not srcset:
-            return []
-        urls = []
-        for part in srcset.split(","):
-            part = part.strip()
-            if part:
-                url = part.split()[0]
-                resolved = self._resolve(url)
-                if resolved:
-                    urls.append(resolved)
-        return urls
-
-
-# ---------------------------------------------------------------------------
-# CSS background-image extractor (from <style> blocks)
-# ---------------------------------------------------------------------------
-
-def extract_css_bg_images(html: str, base_url: str) -> List[Dict]:
-    """Pull background-image URLs out of <style> blocks."""
-    images: List[Dict] = []
-    for style_block in re.findall(r"<style[^>]*>(.*?)</style>", html, re.DOTALL | re.IGNORECASE):
-        for match in re.finditer(
-            r'([.#][\w-]+)[^{]*\{[^}]*background(?:-image)?\s*:[^;]*url\(["\']?([^"\')\s]+)["\']?\)',
-            style_block,
-        ):
-            selector, bg_url = match.group(1), match.group(2)
-            resolved = urljoin(base_url, bg_url) if not bg_url.startswith("data:") else ""
-            if resolved:
-                images.append({
-                    "url": resolved,
-                    "alt": "",
-                    "title": "",
-                    "class": selector,
-                    "width": 0,
-                    "height": 0,
-                    "srcset": [],
-                    "context": f"css({selector})",
-                    "tag": "css-bg",
-                })
-    return images
-
 
 # ---------------------------------------------------------------------------
 # Banner filtering
@@ -207,7 +59,6 @@ def is_banner_candidate(img: Dict, include_all: bool = False) -> bool:
     """Decide if an image looks like a promotional banner."""
     url_lower = img["url"].lower()
 
-    # Always skip known non-banner patterns
     if any(skip in url_lower for skip in SKIP_PATTERNS):
         return False
 
@@ -217,36 +68,34 @@ def is_banner_candidate(img: Dict, include_all: bool = False) -> bool:
     text = f"{img['alt']} {img['title']} {img['class']} {img['url']} {img['context']}".lower()
 
     has_keyword = any(kw in text for kw in PROMO_KEYWORDS)
-    has_promo_url = any(ind in url_lower for ind in ["banner", "promo", "bonus", "offer", "campaign", "hero", "slide"])
+    has_promo_url = any(ind in url_lower for ind in [
+        "banner", "promo", "bonus", "offer", "campaign", "hero", "slide"
+    ])
 
-    # Size heuristic (when known)
     w, h = img["width"], img["height"]
     size_ok = True
     if w > 0 and h > 0:
         size_ok = w >= 200 and h >= 80
-        if w > 0 and h > 0:
-            ratio = w / h
-            size_ok = size_ok and (0.8 <= ratio <= 8.0)
+        ratio = w / h
+        size_ok = size_ok and (0.8 <= ratio <= 8.0)
 
     return (has_keyword or has_promo_url) and size_ok
 
 
 # ---------------------------------------------------------------------------
-# Image downloading & validation
+# Image utilities
 # ---------------------------------------------------------------------------
 
-# Magic bytes for common image formats
 IMAGE_SIGNATURES = {
     b"\xff\xd8\xff": "jpg",
     b"\x89PNG": "png",
     b"GIF87a": "gif",
     b"GIF89a": "gif",
-    b"RIFF": "webp",  # RIFF....WEBP
+    b"RIFF": "webp",
 }
 
 
 def detect_image_type(data: bytes) -> Optional[str]:
-    """Detect image type from file header bytes."""
     for sig, fmt in IMAGE_SIGNATURES.items():
         if data[:len(sig)] == sig:
             if fmt == "webp" and data[8:12] != b"WEBP":
@@ -256,17 +105,14 @@ def detect_image_type(data: bytes) -> Optional[str]:
 
 
 def get_image_dimensions(filepath: Path) -> Tuple[int, int]:
-    """Read image dimensions from file header without PIL."""
     try:
         with open(filepath, "rb") as f:
             header = f.read(32)
 
-        # PNG
         if header[:4] == b"\x89PNG":
             w, h = struct.unpack(">II", header[16:24])
             return w, h
 
-        # JPEG – scan for SOF0/SOF2 marker
         with open(filepath, "rb") as f:
             data = f.read()
         if data[:2] == b"\xff\xd8":
@@ -282,7 +128,6 @@ def get_image_dimensions(filepath: Path) -> Tuple[int, int]:
                 else:
                     i += 1
 
-        # GIF
         if header[:3] == b"GIF":
             w, h = struct.unpack("<HH", header[6:10])
             return w, h
@@ -292,31 +137,180 @@ def get_image_dimensions(filepath: Path) -> Tuple[int, int]:
     return 0, 0
 
 
-def download_image(session: requests.Session, url: str, dest_dir: Path, index: int) -> Optional[Dict]:
-    """Download a single image and return metadata or None."""
+def _parse_dim(val) -> int:
+    if not val:
+        return 0
     try:
-        resp = session.get(url, timeout=15, stream=True, headers={
-            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            "Sec-Fetch-Dest": "image",
-            "Sec-Fetch-Mode": "no-cors",
-            "Sec-Fetch-Site": "same-origin",
-        })
-        resp.raise_for_status()
+        return int(str(val).replace("px", "").strip())
+    except ValueError:
+        return 0
 
-        content_type = resp.headers.get("content-type", "")
+
+# ---------------------------------------------------------------------------
+# Playwright-based page scraper
+# ---------------------------------------------------------------------------
+
+def extract_images_from_page(page, url: str) -> List[Dict]:
+    """Use Playwright to extract all image data from the rendered page."""
+    images = []
+
+    # Extract <img> elements via JavaScript (gets the fully rendered DOM)
+    img_data = page.evaluate("""() => {
+        const imgs = [];
+        for (const img of document.querySelectorAll('img')) {
+            const src = img.currentSrc || img.src || img.dataset.src || img.dataset.lazySrc || '';
+            if (!src || src.startsWith('data:')) continue;
+
+            // Get parent context
+            let context = '';
+            let el = img.parentElement;
+            const parts = [];
+            for (let i = 0; i < 3 && el; i++) {
+                const cls = el.className || '';
+                const id = el.id || '';
+                parts.unshift(`${el.tagName.toLowerCase()}.${cls} #${id}`);
+                el = el.parentElement;
+            }
+            context = parts.join(' > ');
+
+            imgs.push({
+                url: src,
+                alt: img.alt || '',
+                title: img.title || '',
+                className: img.className || '',
+                width: img.naturalWidth || img.width || 0,
+                height: img.naturalHeight || img.height || 0,
+                context: context,
+            });
+        }
+        return imgs;
+    }""")
+
+    for img in img_data:
+        resolved = urljoin(url, img["url"])
+        images.append({
+            "url": resolved,
+            "alt": img["alt"],
+            "title": img["title"],
+            "class": img["className"],
+            "width": img["width"],
+            "height": img["height"],
+            "srcset": [],
+            "context": img["context"],
+            "tag": "img",
+        })
+
+    # Extract <source> srcset entries
+    source_data = page.evaluate("""() => {
+        const sources = [];
+        for (const source of document.querySelectorAll('source[srcset]')) {
+            const srcset = source.srcset || '';
+            for (const part of srcset.split(',')) {
+                const url = part.trim().split(/\\s+/)[0];
+                if (url && !url.startsWith('data:')) {
+                    sources.push(url);
+                }
+            }
+        }
+        return sources;
+    }""")
+
+    for src_url in source_data:
+        resolved = urljoin(url, src_url)
+        images.append({
+            "url": resolved, "alt": "", "title": "",
+            "class": "", "width": 0, "height": 0, "srcset": [],
+            "context": "", "tag": "source",
+        })
+
+    # Extract background-image from inline styles
+    bg_data = page.evaluate("""() => {
+        const results = [];
+        for (const el of document.querySelectorAll('[style]')) {
+            const style = el.getAttribute('style') || '';
+            const matches = style.matchAll(/background(?:-image)?\\s*:[^;]*url\\(["']?([^"')\\s]+)["']?\\)/g);
+            for (const m of matches) {
+                if (!m[1].startsWith('data:')) {
+                    results.push({
+                        url: m[1],
+                        className: el.className || '',
+                        tag: el.tagName.toLowerCase(),
+                    });
+                }
+            }
+        }
+        return results;
+    }""")
+
+    for bg in bg_data:
+        resolved = urljoin(url, bg["url"])
+        images.append({
+            "url": resolved, "alt": "", "title": "",
+            "class": bg["className"], "width": 0, "height": 0, "srcset": [],
+            "context": bg["tag"], "tag": f"{bg['tag']}[style]",
+        })
+
+    # Extract background-image from computed styles on common banner containers
+    css_bg_data = page.evaluate("""() => {
+        const results = [];
+        const selectors = [
+            '[class*="banner"]', '[class*="hero"]', '[class*="slider"]',
+            '[class*="carousel"]', '[class*="promo"]', '[class*="slide"]',
+            'header', 'section', '[class*="featured"]',
+        ];
+        const seen = new Set();
+        for (const selector of selectors) {
+            for (const el of document.querySelectorAll(selector)) {
+                if (seen.has(el)) continue;
+                seen.add(el);
+                const bg = getComputedStyle(el).backgroundImage;
+                if (bg && bg !== 'none') {
+                    const matches = bg.matchAll(/url\\(["']?([^"')]+)["']?\\)/g);
+                    for (const m of matches) {
+                        if (!m[1].startsWith('data:')) {
+                            results.push({
+                                url: m[1],
+                                className: el.className || '',
+                                tag: el.tagName.toLowerCase(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        return results;
+    }""")
+
+    for bg in css_bg_data:
+        resolved = urljoin(url, bg["url"])
+        images.append({
+            "url": resolved, "alt": "", "title": "",
+            "class": bg["className"], "width": 0, "height": 0, "srcset": [],
+            "context": f"css-computed({bg['tag']})", "tag": "css-bg",
+        })
+
+    return images
+
+
+def download_image_playwright(page, url: str, dest_dir: Path, index: int) -> Optional[Dict]:
+    """Download an image using the browser context (inherits cookies/session)."""
+    try:
+        response = page.request.get(url, timeout=15000)
+        if response.status != 200:
+            return None
+
+        content_type = response.headers.get("content-type", "")
         if "image" not in content_type and "octet-stream" not in content_type:
             return None
 
-        data = resp.content
-        if len(data) < 500:
-            return None
-        if len(data) > 10 * 1024 * 1024:
+        data = response.body()
+        if len(data) < 500 or len(data) > 10 * 1024 * 1024:
             return None
 
         img_type = detect_image_type(data)
         if not img_type:
-            # Fall back to content-type
-            for ct, ext in [("jpeg", "jpg"), ("jpg", "jpg"), ("png", "png"), ("gif", "gif"), ("webp", "webp")]:
+            for ct, ext in [("jpeg", "jpg"), ("jpg", "jpg"), ("png", "png"),
+                            ("gif", "gif"), ("webp", "webp")]:
                 if ct in content_type:
                     img_type = ext
                     break
@@ -326,7 +320,6 @@ def download_image(session: requests.Session, url: str, dest_dir: Path, index: i
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         filename = f"banner_{index:03d}_{url_hash}.{img_type}"
         filepath = dest_dir / filename
-
         filepath.write_bytes(data)
 
         w, h = get_image_dimensions(filepath)
@@ -350,180 +343,86 @@ def download_image(session: requests.Session, url: str, dest_dir: Path, index: i
 # Main scraper
 # ---------------------------------------------------------------------------
 
-def fetch_page(session: requests.Session, url: str) -> str:
-    """Fetch the full HTML of a page with retry logic for bot protection."""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            resp = session.get(url, timeout=20)
-            resp.raise_for_status()
-            return resp.text
-        except requests.HTTPError as e:
-            if resp.status_code == 403 and attempt < max_retries - 1:
-                wait = 2 ** (attempt + 1)
-                logger.warning(
-                    f"Got 403 Forbidden (attempt {attempt + 1}/{max_retries}). "
-                    f"Retrying in {wait}s..."
-                )
-                time.sleep(wait)
-                # Rotate User-Agent on retry
-                agents = [
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (X11; Linux x86_64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
-                    "Gecko/20100101 Firefox/126.0",
-                ]
-                session.headers["User-Agent"] = agents[attempt % len(agents)]
-                session.headers["Referer"] = url
-                continue
-            raise
-
-
-def scrape_banners(url: str, output_dir: str = "novadreams_banners", all_images: bool = False) -> List[Dict]:
-    """
-    Scrape banner images from the given URL.
-
-    Args:
-        url: Target page URL.
-        output_dir: Directory to save downloaded banners.
-        all_images: If True, download all images (not just detected banners).
-
-    Returns:
-        List of metadata dicts for each downloaded image.
-    """
+def scrape_banners(url: str, output_dir: str = "novadreams_banners",
+                   all_images: bool = False) -> List[Dict]:
     site_name = urlparse(url).netloc.replace(".", "_").replace(":", "_")
     dest_dir = Path(output_dir) / site_name
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Sec-Ch-Ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Connection": "keep-alive",
-    })
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
 
-    logger.info(f"Fetching {url} ...")
-    html = fetch_page(session, url)
-    logger.info(f"Received {len(html)} bytes of HTML")
+        # Navigate and wait for page to fully load
+        logger.info(f"Launching browser and navigating to {url} ...")
+        try:
+            page.goto(url, wait_until="networkidle", timeout=60000)
+        except PlaywrightTimeout:
+            logger.warning("Page load timed out, proceeding with partial content")
 
-    # Set Referer for subsequent image requests
-    session.headers["Referer"] = url
+        # Extra wait for lazy-loaded content / JS carousels
+        page.wait_for_timeout(3000)
 
-    # --- Parse images ---
-    all_found: List[Dict] = []
+        # Scroll down to trigger lazy loading
+        logger.info("Scrolling page to trigger lazy-loaded images...")
+        page.evaluate("""async () => {
+            const delay = ms => new Promise(r => setTimeout(r, ms));
+            for (let i = 0; i < 5; i++) {
+                window.scrollBy(0, window.innerHeight);
+                await delay(500);
+            }
+            window.scrollTo(0, 0);
+        }""")
+        page.wait_for_timeout(2000)
 
-    if HAS_BS4:
-        logger.info("Parsing with BeautifulSoup")
-        soup = BeautifulSoup(html, "html.parser")
+        logger.info("Extracting images from rendered page...")
+        all_found = extract_images_from_page(page, url)
 
-        for img in soup.find_all("img"):
-            src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
-            if not src or src.startswith("data:"):
-                continue
-            resolved = urljoin(url, src)
-            parent_classes = " ".join(
-                c for p in img.parents for c in (p.get("class") or [])
-            )
-            all_found.append({
-                "url": resolved,
-                "alt": img.get("alt", ""),
-                "title": img.get("title", ""),
-                "class": " ".join(img.get("class", [])),
-                "width": ImageHTMLParser._parse_dim(img.get("width")),
-                "height": ImageHTMLParser._parse_dim(img.get("height")),
-                "srcset": [],
-                "context": parent_classes,
-                "tag": "img",
-            })
-            # Also grab srcset entries
-            for srcset_url in ImageHTMLParser(url)._parse_srcset(img.get("srcset", "")):
-                all_found.append({
-                    "url": srcset_url, "alt": img.get("alt", ""), "title": "",
-                    "class": "", "width": 0, "height": 0, "srcset": [],
-                    "context": parent_classes, "tag": "img[srcset]",
-                })
+        # Deduplicate
+        seen_urls = set()
+        unique: List[Dict] = []
+        for img in all_found:
+            if img["url"] not in seen_urls:
+                seen_urls.add(img["url"])
+                unique.append(img)
 
-        for source in soup.find_all("source"):
-            for srcset_url in ImageHTMLParser(url)._parse_srcset(source.get("srcset", "")):
-                all_found.append({
-                    "url": srcset_url, "alt": "", "title": "",
-                    "class": "", "width": 0, "height": 0, "srcset": [],
-                    "context": "", "tag": "source",
-                })
+        logger.info(f"Found {len(unique)} unique images")
 
-        for el in soup.find_all(style=True):
-            style = el.get("style", "")
-            for bg_url in re.findall(r'background(?:-image)?\s*:[^;]*url\(["\']?([^"\')\s]+)["\']?\)', style):
-                if not bg_url.startswith("data:"):
-                    all_found.append({
-                        "url": urljoin(url, bg_url), "alt": "", "title": "",
-                        "class": " ".join(el.get("class", [])),
-                        "width": 0, "height": 0, "srcset": [],
-                        "context": el.name, "tag": f"{el.name}[style]",
-                    })
-    else:
-        logger.info("Parsing with stdlib HTMLParser (install bs4 for better results)")
-        parser = ImageHTMLParser(url)
-        parser.feed(html)
-        all_found.extend(parser.images)
+        # Filter
+        candidates = [img for img in unique if is_banner_candidate(img, include_all=all_images)]
+        label = "images" if all_images else "banner candidates"
+        logger.info(f"Identified {len(candidates)} {label}")
 
-    # CSS <style> block images
-    all_found.extend(extract_css_bg_images(html, url))
+        if not candidates:
+            logger.warning("No banners found. Try --all-images to download every image.")
+            browser.close()
+            return []
 
-    # --- Deduplicate ---
-    seen_urls = set()
-    unique: List[Dict] = []
-    for img in all_found:
-        if img["url"] not in seen_urls:
-            seen_urls.add(img["url"])
-            unique.append(img)
+        # Download using browser context (inherits cookies, passes bot checks)
+        downloaded: List[Dict] = []
+        for i, img in enumerate(candidates, 1):
+            logger.info(f"Downloading {i}/{len(candidates)}: {img['url'][:80]}...")
+            meta = download_image_playwright(page, img["url"], dest_dir, i)
+            if meta:
+                meta["alt"] = img.get("alt", "")
+                meta["title"] = img.get("title", "")
+                meta["source_tag"] = img.get("tag", "")
+                meta["context"] = img.get("context", "")
+                downloaded.append(meta)
+                logger.info(f"  Saved {meta['filename']} ({meta['width']}x{meta['height']}, {meta['size_bytes']} bytes)")
+            time.sleep(0.3)
 
-    logger.info(f"Found {len(unique)} unique images")
+        browser.close()
 
-    # --- Filter ---
-    candidates = [img for img in unique if is_banner_candidate(img, include_all=all_images)]
-    label = "images" if all_images else "banner candidates"
-    logger.info(f"Identified {len(candidates)} {label}")
-
-    if not candidates:
-        logger.warning("No banners found. Try --all-images to download every image.")
-        return []
-
-    # --- Download ---
-    downloaded: List[Dict] = []
-    for i, img in enumerate(candidates, 1):
-        logger.info(f"Downloading {i}/{len(candidates)}: {img['url'][:80]}...")
-        meta = download_image(session, img["url"], dest_dir, i)
-        if meta:
-            meta["alt"] = img.get("alt", "")
-            meta["title"] = img.get("title", "")
-            meta["source_tag"] = img.get("tag", "")
-            meta["context"] = img.get("context", "")
-            downloaded.append(meta)
-            logger.info(f"  Saved {meta['filename']} ({meta['width']}x{meta['height']}, {meta['size_bytes']} bytes)")
-        time.sleep(0.3)
-
-    # --- Save manifest ---
+    # Save manifest
     manifest_path = dest_dir / "manifest.json"
     manifest = {
         "source_url": url,
@@ -545,7 +444,7 @@ def scrape_banners(url: str, output_dir: str = "novadreams_banners", all_images:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape promotional banner images from novadreams.com",
+        description="Scrape promotional banner images using Playwright (headless Chromium)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -587,21 +486,6 @@ Examples:
             print("\nNo banner images found.")
             print("Tip: try --all-images to grab everything, or check a subpage like /promotions")
 
-    except requests.ConnectionError:
-        print(f"\nCould not connect to {args.url}")
-        print("Check your internet connection and that the URL is correct.")
-        sys.exit(1)
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 403:
-            logger.error(f"Access denied (403 Forbidden) after retries: {args.url}")
-            logger.error("The site may be using CloudFlare or similar bot protection.")
-            logger.error("Suggestions:")
-            logger.error("  1. Try a specific subpage: --url https://www.novadreams.com/promotions")
-            logger.error("  2. Try again later (rate limiting may expire)")
-            logger.error("  3. Check if the site is accessible in your browser")
-        else:
-            logger.error(f"HTTP error: {e}")
-        sys.exit(1)
     except Exception as e:
         logger.error(f"Scraping failed: {e}")
         sys.exit(1)
