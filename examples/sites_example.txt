@@ -1,0 +1,8 @@
+# Example casino sites for batch extraction
+# One URL per line, lines starting with # are comments
+
+casino1.com
+mega-slots.com
+bonus-palace.com
+jackpot-city.com
+lucky-wins.com
